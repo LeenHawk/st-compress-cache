@@ -9,14 +9,7 @@ SillyTavern 第三方 UI 扩展。两件事：
 
 ## 安装
 
-把整个 `st-compress-cache/` 文件夹放到 SillyTavern 的第三方扩展目录：
-
-- 单用户：`SillyTavern/data/<你的用户名>/extensions/st-compress-cache/`
-- 全体用户：`SillyTavern/public/scripts/extensions/third-party/st-compress-cache/`
-
-刷新页面后，在 **扩展（Extensions）面板** 里会出现「压缩与缓存断点」设置抽屉。
-
-> `manifest.json` 里的 `generate_interceptor` 字段是断点注入的关键，改名或删除会导致断点失效。
+参照其他的插件进行安装
 
 ---
 
