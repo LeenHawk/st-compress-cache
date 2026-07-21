@@ -242,12 +242,22 @@ async function runCompression(countOverride, { silent = false } = {}) {
     };
 
     if (s.hideOriginals) {
-        const lo = Math.min(...targets);
-        const hi = Math.max(...targets);
+        // 按连续区间分组隐藏，避免 min-max 整段误伤夹在中间的非目标消息（如上一条摘要）
+        const runs = [];
+        let runStart = targets[0], prev = targets[0];
+        for (const i of targets.slice(1)) {
+            if (i === prev + 1) { prev = i; continue; }
+            runs.push([runStart, prev]);
+            runStart = prev = i;
+        }
+        runs.push([runStart, prev]);
+
         let hid = false;
         try {
             if (ctx.executeSlashCommandsWithOptions) {
-                await ctx.executeSlashCommandsWithOptions(`/hide ${lo}-${hi}`);
+                for (const [a, b] of runs) {
+                    await ctx.executeSlashCommandsWithOptions(a === b ? `/hide ${a}` : `/hide ${a}-${b}`);
+                }
                 hid = true;
             }
         } catch (e) {
