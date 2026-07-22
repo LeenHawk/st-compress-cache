@@ -8,7 +8,11 @@
  *     - 自动模式：用户每发送 N 条消息（编辑重发不计入），在当次回复结束后
  *       自动压缩上次压缩点之后的消息。自动模式开启时仍可随时手动压缩。
  *     触发入口：设置面板按钮、输入框旁“选项”菜单（重新生成/AI帮答/续写 同级）、/compress 命令。
- *  2) 三组缓存断点（TTL 可配）：
+ *  2) 改写上一条：在输入框写下改写要求，点“选项”菜单里的「改写上一条」或
+ *     /rewrite 命令，对最后一条 AI 回复做局部改写（搜索替换块）或整条重写。
+ *     指令不进存档；原文保存为 swipe；请求命中已有缓存前缀（只在最后一条
+ *     user 消息打断点，与上一轮位置一致，纯命中、零新写入）。
+ *  3) 三组缓存断点（TTL 可配）：
  *       - 上次压缩结果所在的消息（默认关闭）
  *       - 倒数第一条 assistant 消息
  *       - 输入消息（最后一条 user 消息）
@@ -29,6 +33,22 @@ const GPROXY_MAGIC = Object.freeze({
 });
 
 let isCompressing = false;
+let isRewriting = false;
+
+// 改写输出格式说明（内部固定，不随用户提示词变化，保证可解析）
+const REWRITE_FORMAT_DIFF =
+    'Output ONLY one or more search-and-replace blocks in exactly this format, with nothing else:\n' +
+    '<<<<<<< SEARCH\n' +
+    '(an excerpt copied character-for-character from the latest assistant reply)\n' +
+    '=======\n' +
+    '(the replacement text)\n' +
+    '>>>>>>> REPLACE\n' +
+    'Rules: each SEARCH excerpt must appear verbatim in the reply and be unique within it; ' +
+    'keep excerpts as short as possible while remaining unique; prefer several small blocks ' +
+    'over one large block; do not rewrite parts the revision request does not touch.';
+
+const REWRITE_FORMAT_FULL =
+    'Output ONLY the complete revised reply, with no preamble, no commentary, and no surrounding quotes.';
 
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
@@ -44,6 +64,14 @@ const DEFAULT_SETTINGS = Object.freeze({
     compressRole: 'assistant',  // 摘要写回时的角色：assistant / user
     hideOriginals: true,        // 压缩后是否把原始消息隐藏出上下文
     summaryPrefix: '【压缩记忆】\n',
+
+    // —— 改写上一条 ——
+    rewriteDiffMode: true,      // true：模型只输出改动片段（搜索替换块）；false：整条重写
+    rewritePrompt:
+        'You are revising the latest assistant reply in the conversation above. Apply the ' +
+        'revision request with the minimal necessary changes: keep the wording, style, ' +
+        'formatting and all content not covered by the request unchanged. Write in the same ' +
+        'language as the original reply.',
 
     // —— 模式 ——
     autoMode: false,            // 自动模式开关（关闭即手动模式）
@@ -143,8 +171,28 @@ globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort
     try {
         const s = getSettings();
         if (!s.enabled || s.cacheMode !== 'magic') return;
-        if (isCompressing || type === 'quiet') return;
         if (!Array.isArray(chat) || chat.length === 0) return;
+
+        // 改写请求：Claude 只有在请求带缓存标记时才会查缓存，因此这里必须打一个断点。
+        // 打在最后一条 user 消息上——与上一轮的「输入消息」断点位置一致，前缀完全相同，
+        // 纯命中已有缓存、不产生新写入。不打在待改写的 assistant 消息上（它马上要变，写了也浪费）。
+        if (isRewriting) {
+            for (let i = chat.length - 1; i >= 0; i--) {
+                const m = chat[i];
+                if (m && m.is_user === true && m.is_system !== true) {
+                    const marker = markerForTtl(s, s.bpInput.ttl);
+                    if (marker) {
+                        const clone = structuredClone(m);
+                        clone.mes = (clone.mes ?? '') + '\n' + marker;
+                        chat[i] = clone;
+                    }
+                    break;
+                }
+            }
+            return;
+        }
+
+        if (isCompressing || type === 'quiet') return;
 
         warnIfMergeRisk(s);
 
@@ -315,6 +363,172 @@ async function runCompression(countOverride, { silent = false } = {}) {
 }
 
 // ============================================================
+//  改写上一条
+// ============================================================
+const DIFF_BLOCK_RE = /<{4,}\s*SEARCH\s*\r?\n([\s\S]*?)\r?\n={4,}\r?\n([\s\S]*?)\r?\n>{4,}\s*REPLACE/g;
+
+function findLastAssistantIndex(chat) {
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (m && m.is_user === false && m.is_system !== true) return i;
+    }
+    return -1;
+}
+
+// 依次尝试：精确匹配 → 去首尾空白 → 空白容错（连续空白折叠为 \s+）
+function applySearchReplace(text, search, replace) {
+    if (search && text.includes(search)) {
+        return text.replace(search, () => replace);
+    }
+    const trimmed = String(search ?? '').trim();
+    if (!trimmed) return null;
+    if (text.includes(trimmed)) {
+        return text.replace(trimmed, () => replace);
+    }
+    try {
+        const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+        const re = new RegExp(escaped);
+        if (re.test(text)) return text.replace(re, () => replace);
+    } catch { /* 正则构造失败则视为未匹配 */ }
+    return null;
+}
+
+// 整条重写模式下，剥掉模型可能包裹的代码围栏
+function stripCodeFence(text) {
+    const m = text.match(/^```[^\n]*\n([\s\S]*?)\n?```$/);
+    return m ? m[1] : text;
+}
+
+async function runRewrite(instruction) {
+    if (isRewriting || isCompressing) {
+        toastr.warning('已有任务在进行中');
+        return false;
+    }
+    instruction = String(instruction ?? '').trim();
+    if (!instruction) {
+        toastr.warning('请先在输入框写下改写要求，再点「改写上一条」');
+        return false;
+    }
+    const ctx = SillyTavern.getContext();
+    const s = getSettings();
+    const chat = ctx.chat;
+    if (!Array.isArray(chat) || chat.length === 0) {
+        toastr.warning('当前没有聊天记录');
+        return false;
+    }
+    const idx = findLastAssistantIndex(chat);
+    if (idx < 0) {
+        toastr.warning('没有可改写的 AI 消息');
+        return false;
+    }
+    const msg = chat[idx];
+    const original = String(msg.mes ?? '');
+
+    const quietPrompt = [
+        s.rewritePrompt,
+        `Revision request: ${instruction}`,
+        s.rewriteDiffMode ? REWRITE_FORMAT_DIFF : REWRITE_FORMAT_FULL,
+    ].join('\n\n');
+
+    let result = '';
+    const loaderHandle = ctx.loader ? ctx.loader.show({ message: '正在改写上一条…' }) : null;
+    isRewriting = true;
+    try {
+        // quiet 生成走完整 prompt 构建管线（预设/世界书/全量历史），指令注入在末尾，不破坏缓存前缀
+        result = await ctx.generateQuietPrompt({ quietPrompt });
+    } catch (e) {
+        console.error(LOG, '改写生成失败：', e);
+        toastr.error('改写生成失败，详见控制台');
+        return false;
+    } finally {
+        isRewriting = false;
+        if (loaderHandle) await loaderHandle.hide();
+    }
+
+    result = String(result ?? '').trim();
+    if (!result) {
+        toastr.error('改写失败：模型返回为空');
+        return false;
+    }
+
+    let newText;
+    if (s.rewriteDiffMode) {
+        const blocks = [...result.matchAll(DIFF_BLOCK_RE)].map((m) => ({ search: m[1], replace: m[2] }));
+        if (blocks.length === 0) {
+            console.warn(LOG, '未解析出替换块，模型原始输出：', result);
+            toastr.error('改写失败：未能从模型输出中解析出替换块（原文未改动，详见控制台）');
+            return false;
+        }
+        let text = original, ok = 0, fail = 0;
+        for (const b of blocks) {
+            const applied = applySearchReplace(text, b.search, b.replace);
+            if (applied === null) fail++;
+            else { text = applied; ok++; }
+        }
+        if (ok === 0) {
+            toastr.error('改写失败：所有替换块都与原文不匹配（原文未改动）');
+            return false;
+        }
+        if (fail > 0) toastr.warning(`有 ${fail} 个替换块未匹配到原文，已应用其余 ${ok} 个`);
+        newText = text;
+    } else {
+        newText = stripCodeFence(result);
+    }
+
+    if (newText === original) {
+        toastr.info('改写结果与原文相同，未做修改');
+        return false;
+    }
+
+    // 原文备份为 swipe，可左滑找回
+    if (!Array.isArray(msg.swipes) || msg.swipes.length === 0) {
+        msg.swipes = [original];
+        msg.swipe_id = 0;
+    }
+    if (!Number.isInteger(msg.swipe_id) || msg.swipe_id < 0 || msg.swipe_id >= msg.swipes.length) {
+        msg.swipe_id = msg.swipes.length - 1;
+    }
+    if (!Array.isArray(msg.swipe_info) || msg.swipe_info.length !== msg.swipes.length) {
+        msg.swipe_info = msg.swipes.map(() => ({
+            send_date: msg.send_date,
+            gen_started: msg.gen_started,
+            gen_finished: msg.gen_finished,
+            extra: structuredClone(msg.extra ?? {}),
+        }));
+    }
+    msg.swipes.push(newText);
+    msg.swipe_info.push({
+        send_date: ctx.getMessageTimeStamp ? ctx.getMessageTimeStamp() : new Date().toISOString(),
+        gen_started: msg.gen_started,
+        gen_finished: msg.gen_finished,
+        extra: structuredClone(msg.extra ?? {}),
+    });
+    msg.swipe_id = msg.swipes.length - 1;
+    msg.mes = newText;
+
+    try {
+        if (typeof ctx.updateMessageBlock === 'function') {
+            ctx.updateMessageBlock(idx, msg);
+        } else if (ctx.reloadCurrentChat) {
+            await ctx.reloadCurrentChat();
+        }
+    } catch (e) {
+        console.warn(LOG, '刷新消息渲染失败：', e);
+    }
+    try {
+        await ctx.eventSource.emit(ctx.event_types.MESSAGE_UPDATED, idx);
+    } catch { /* 事件通知失败不影响主流程 */ }
+    try {
+        if (ctx.saveChat) await ctx.saveChat();
+    } catch (e) {
+        console.warn(LOG, 'saveChat 失败：', e);
+    }
+
+    toastr.success(s.rewriteDiffMode ? '改写完成（原文已存为 swipe，可左滑找回）' : '已整条重写（原文已存为 swipe）');
+    return true;
+}
+
+// ============================================================
 //  自动模式：事件监听
 // ============================================================
 function onMessageSent() {
@@ -331,7 +545,7 @@ function onMessageSent() {
 function onGenerationEnded() {
     try {
         const s = getSettings();
-        if (!s.enabled || !s.autoMode || isCompressing) return;
+        if (!s.enabled || !s.autoMode || isCompressing || isRewriting) return;
         const st = getChatState();
         const every = Math.max(1, Number(s.autoEvery) || 10);
         if ((st.userMsgCount || 0) >= every) {
@@ -371,6 +585,28 @@ function addOptionsMenuButton() {
     $(document).on('click', '#option_compress_context', async function () {
         try { $('#options').hide(); } catch { /* ignore */ }
         await runCompression();
+    });
+}
+
+function addRewriteMenuButton() {
+    if ($('#option_rewrite_last').length) return;
+    const html = `
+        <a id="option_rewrite_last" class="interactable" tabindex="0">
+            <i class="fa-lg fa-solid fa-pen-nib"></i>
+            <span>改写上一条</span>
+        </a>`;
+    const $anchor = $('#option_compress_context');
+    if ($anchor.length) {
+        $anchor.after(html);
+    } else {
+        $('#options .options-content').append(html);
+    }
+    $(document).on('click', '#option_rewrite_last', async function () {
+        try { $('#options').hide(); } catch { /* ignore */ }
+        const $ta = $('#send_textarea');
+        const ok = await runRewrite(String($ta.val() ?? ''));
+        // 成功后清空输入框（触发 input 让 ST 刷新 token 计数等）；失败保留指令便于重试
+        if (ok) $ta.val('').trigger('input');
     });
 }
 
@@ -444,6 +680,18 @@ function buildSettingsHtml() {
           </label>
 
           <hr>
+          <h4>改写上一条</h4>
+
+          <label class="checkbox_label" for="cc_rw_diff">
+            <input id="cc_rw_diff" type="checkbox" />
+            <span>局部替换模式（模型只输出改动片段，省 token、不动其余部分；关闭则整条重写）</span>
+          </label>
+
+          <label for="cc_rw_prompt">改写提示词</label>
+          <textarea id="cc_rw_prompt" class="text_pole textarea_compact" rows="4"></textarea>
+          <small class="notes">用法：在输入框写下改写要求，点“选项”菜单里的「改写上一条」，或用 <code>/rewrite 要求</code>。指令不进聊天记录；原文自动存为 swipe，可左滑找回。改写请求只重算最后一条回复，其余前缀命中缓存。</small>
+
+          <hr>
           <h4>缓存断点（gproxy 魔法字符串）</h4>
 
           <label for="cc_mode">断点开关</label>
@@ -507,6 +755,8 @@ function refreshUI() {
     $('#cc_role').val(s.compressRole);
     $('#cc_prefix').val(s.summaryPrefix);
     $('#cc_hide').prop('checked', s.hideOriginals);
+    $('#cc_rw_diff').prop('checked', s.rewriteDiffMode);
+    $('#cc_rw_prompt').val(s.rewritePrompt);
     $('#cc_mode').val(s.cacheMode);
     $('#cc_bp1_en').prop('checked', s.bpCompression.enabled);
     $('#cc_bp1_ttl').val(s.bpCompression.ttl);
@@ -530,6 +780,8 @@ function bindUI() {
     $('#cc_role').on('change', function () { s.compressRole = String($(this).val()); save(); });
     $('#cc_prefix').on('input', function () { s.summaryPrefix = String($(this).val()); save(); });
     $('#cc_hide').on('change', function () { s.hideOriginals = $(this).prop('checked'); save(); });
+    $('#cc_rw_diff').on('change', function () { s.rewriteDiffMode = $(this).prop('checked'); save(); });
+    $('#cc_rw_prompt').on('input', function () { s.rewritePrompt = String($(this).val()); save(); });
 
     $('#cc_mode').on('change', function () { s.cacheMode = String($(this).val()); save(); });
 
@@ -574,6 +826,21 @@ function registerSlashCommand() {
                 }),
             ] : [],
         }));
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'rewrite',
+            helpString: '按指令局部改写最后一条 AI 回复（原文存为 swipe，缓存前缀保留）。用法：/rewrite 把结尾改含蓄一点',
+            callback: async (_named, unnamed) => {
+                await runRewrite(String(unnamed ?? ''));
+                return '';
+            },
+            unnamedArgumentList: SlashCommandArgument ? [
+                SlashCommandArgument.fromProps({
+                    description: '改写要求',
+                    typeList: ARGUMENT_TYPE ? [ARGUMENT_TYPE.STRING] : undefined,
+                    isRequired: true,
+                }),
+            ] : [],
+        }));
     } catch (e) {
         console.warn(LOG, '注册斜杠命令失败（可忽略）：', e);
     }
@@ -590,6 +857,7 @@ jQuery(async () => {
         refreshUI();
         bindUI();
         addOptionsMenuButton();
+        addRewriteMenuButton();
         registerSlashCommand();
 
         const { eventSource, event_types } = ctx;
