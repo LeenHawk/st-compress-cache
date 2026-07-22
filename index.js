@@ -117,12 +117,36 @@ function markerForTtl(s, ttl) {
 // ============================================================
 //  生成拦截器：注入缓存断点魔法字符串（全局函数，供 manifest 引用）
 // ============================================================
+
+// 合并类“提示词后处理”会把相邻同角色消息拼成一个字符串：若预设在对话记录后
+// 还有同角色固定提示词，会被拼进被标记的输入消息里，导致该断点每轮都 miss。
+// （Claude 源不受影响：其合并保留独立 text block，gproxy 按 block 打标。）
+let mergeRiskWarned = false;
+function warnIfMergeRisk(s) {
+    try {
+        if (mergeRiskWarned || !s.bpInput.enabled) return;
+        const cc = SillyTavern.getContext().chatCompletionSettings;
+        if (!cc) return;
+        const merging = ['claude', 'merge', 'merge_tools', 'semi', 'semi_tools', 'strict', 'strict_tools', 'single']
+            .includes(String(cc.custom_prompt_post_processing || ''));
+        if (merging) {
+            mergeRiskWarned = true;
+            console.warn(LOG, '提示词后处理为合并类模式，「输入消息」断点可能因同角色消息合并而失效');
+            toastr.warning(
+                '当前“提示词后处理”为合并类模式：若预设在对话记录后紧跟同角色固定提示词，「输入消息」断点可能每轮失效。建议后处理选“无”，或直接使用 Claude 源。',
+                '压缩与缓存断点', { timeOut: 12000 });
+        }
+    } catch { /* 静默 */ }
+}
+
 globalThis.compressCacheInterceptor = async function (chat, _contextSize, _abort, type) {
     try {
         const s = getSettings();
         if (!s.enabled || s.cacheMode !== 'magic') return;
         if (isCompressing || type === 'quiet') return;
         if (!Array.isArray(chat) || chat.length === 0) return;
+
+        warnIfMergeRisk(s);
 
         let idxCompression = -1, idxLastAssistant = -1, idxInput = -1;
         for (let i = chat.length - 1; i >= 0; i--) {
